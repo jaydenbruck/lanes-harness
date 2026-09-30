@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lanes Harness</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/vendor/xterm.css">
+<style>
+  :root { --bg:#0b0d10; --card:#13161b; --edge:#232830; --fg:#d7dbe0; --dim:#7c8590; --running:#3b82f6; --needs:#f59e0b; --finished:#22c55e; --died:#ef4444; --stalled:#a855f7; --starting:#64748b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.4 ui-monospace, Cascadia Code, Consolas, monospace; }
+  header { position:sticky; top:0; z-index:5; background:rgba(11,13,16,.92); backdrop-filter:blur(6px); border-bottom:1px solid var(--edge); padding:10px 16px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:14px; margin:0; letter-spacing:.04em; font-weight:600; }
+  header .count { color:var(--dim); }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; }
+  .chip { border:1px solid var(--edge); border-radius:999px; padding:2px 10px; color:var(--dim); cursor:pointer; user-select:none; }
+  .chip.on { color:var(--fg); border-color:var(--fg); }
+  #events { max-height:110px; overflow:auto; border-bottom:1px solid var(--edge); padding:6px 16px; color:var(--dim); white-space:pre; font-size:12px; }
+  #events .ev { display:block; }
+  #events .ev b { color:var(--fg); font-weight:600; }
+  main { display:grid; grid-template-columns:repeat(auto-fill, minmax(480px, 1fr)); gap:12px; padding:12px 16px; }
+  .card { background:var(--card); border:1px solid var(--edge); border-radius:10px; overflow:hidden; display:flex; flex-direction:column; min-height:300px; cursor:pointer; transition:border-color .15s; }
+  .card:hover { border-color:#3a4250; }
+  .card .top { display:flex; align-items:center; gap:8px; padding:8px 10px; border-bottom:1px solid var(--edge); }
+  .dot { width:9px; height:9px; border-radius:50%; flex:none; }
+  .card[data-state="running"] .dot { background:var(--running); box-shadow:0 0 8px var(--running); }
+  .card[data-state="needs-input"] .dot { background:var(--needs); box-shadow:0 0 8px var(--needs); animation:pulse 1.2s infinite; }
+  .card[data-state="finished"] .dot { background:var(--finished); }
+  .card[data-state="died"] .dot { background:var(--died); }
+  .card[data-state="stalled"] .dot { background:var(--stalled); animation:pulse 2s infinite; }
+  .card[data-state="starting"] .dot { background:var(--starting); }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+  .name { font-weight:600; }
+  .meta { color:var(--dim); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .state { margin-left:auto; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); }
+  .card[data-state="needs-input"] .state { color:var(--needs); }
+  .card[data-state="died"] .state { color:var(--died); }
+  .card[data-state="finished"] .state { color:var(--finished); }
+  .label { padding:4px 10px; color:var(--dim); font-size:12px; border-bottom:1px solid var(--edge); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-height:22px; }
+  .card[data-state="needs-input"] .label { color:var(--fg); }
+  .termwrap { position:relative; flex:1; overflow:hidden; background:#000; }
+  .term { position:absolute; left:0; top:0; transform-origin:0 0; }
+  .xterm .xterm-viewport { overflow:hidden !important; }
+  #focus { position:fixed; inset:0; background:rgba(0,0,0,.78); display:none; z-index:20; padding:24px; }
+  #focus.on { display:flex; flex-direction:column; }
+  #focus .bar { display:flex; gap:12px; align-items:center; color:var(--dim); padding:0 0 10px; }
+  #focus .bar .name { color:var(--fg); font-size:15px; }
+  #focus .bar button { margin-left:auto; background:var(--card); color:var(--fg); border:1px solid var(--edge); border-radius:6px; padding:4px 10px; cursor:pointer; }
+  #focusterm { flex:1; background:#000; border:1px solid var(--edge); border-radius:8px; overflow:hidden; padding:6px; }
+  #focusinput { display:flex; gap:8px; padding-top:10px; }
+  #focusinput input { flex:1; background:var(--card); color:var(--fg); border:1px solid var(--edge); border-radius:6px; padding:8px 10px; font:inherit; }
+  #focusinput button { background:var(--card); color:var(--fg); border:1px solid var(--edge); border-radius:6px; padding:6px 12px; cursor:pointer; }
+  .empty { color:var(--dim); padding:40px 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>lanes</h1>
+  <span class="count" id="count"></span>
+  <div class="chips" id="heads"></div>
+  <div class="chips" id="states">
+    <span class="chip on" data-f="all">all</span><span class="chip" data-f="needs-input">needs input</span><span class="chip" data-f="running">running</span><span class="chip" data-f="finished">finished</span><span class="chip" data-f="died">died</span>
+  </div>
+</header>
+<div id="events"></div>
+<main id="grid"></main>
+<div id="focus">
+  <div class="bar"><span class="name" id="fname"></span><span id="fmeta"></span><button id="fclose">close (Esc)</button></div>
+  <div id="focusterm"></div>
+  <div id="focusinput"><input id="finput" placeholder="type a message for this lane and press Enter — or click the terminal and type directly"><button id="fsend">send</button></div>
+</div>
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script>
+(function () {
+  const grid = document.getElementById('grid'), cards = new Map(); let headFilter = 'all', stateFilter = 'all';
+  const theme = { background:'#000000', foreground:'#d7dbe0', cursor:'#d7dbe0', selectionBackground:'#3b4252' };
+
+  function fmtQuiet(iso) { if (!iso) return ''; const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000); return s < 60 ? Math.round(s) + 's' : s < 3600 ? Math.round(s/60) + 'm' : Math.round(s/3600) + 'h'; }
+
+  async function showLogTail(card) {
+    // a finished or dead lane has no host to stream from: paint the end of its transcript instead
+    if (card.tailShown) return; card.tailShown = true;
+    try { const r = await fetch('/api/log/' + encodeURIComponent(card.name) + '?tail=65536'); if (r.ok) card.term.write(new Uint8Array(await r.arrayBuffer())); } catch {}
+  }
+  function connect(card) {
+    if (!card.alive) { showLogTail(card); return; }
+    if (card.ws) return;
+    const ws = new WebSocket('ws://' + location.host + '/ws/' + encodeURIComponent(card.name) + '?tail=131072');
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = e => { if (typeof e.data === 'string') { try { const m = JSON.parse(e.data); if (m.exit !== undefined) card.term.write('\r\n\x1b[36m[lane exited ' + m.exit + ']\x1b[0m\r\n'); if (m.gap) card.term.write('\r\n\x1b[33m[viewer fell behind by ' + m.gap + ' bytes; the log is complete]\x1b[0m\r\n'); } catch {} } else card.term.write(new Uint8Array(e.data)); };
+    ws.onclose = () => { card.ws = null; };
+    card.ws = ws;
+  }
+  function disconnect(card) { if (card.ws) { try { card.ws.close(); } catch {} card.ws = null; } }
+
+  const io = new IntersectionObserver(entries => { for (const en of entries) { const card = cards.get(en.target.dataset.name); if (!card) continue; if (en.isIntersecting) connect(card); else disconnect(card); } }, { rootMargin: '200px' });
+
+  function scaleTerm(card) {
+    const wrap = card.el.querySelector('.termwrap'); const t = card.el.querySelector('.term');
+    const w = t.offsetWidth || 1, h = t.offsetHeight || 1; const k = Math.min(wrap.clientWidth / w, wrap.clientHeight / h, 1);
+    t.style.transform = 'scale(' + k + ')';
+  }
+
+  function ensureCard(st) {
+    let card = cards.get(st.name);
+    if (!card) {
+      const el = document.createElement('div'); el.className = 'card'; el.dataset.name = st.name;
+      el.innerHTML = '<div class="top"><span class="dot"></span><span class="name"></span><span class="meta"></span><span class="state"></span></div><div class="label"></div><div class="termwrap"><div class="term"></div></div>';
+      const term = new Terminal({ cols: st.cols || 160, rows: st.rows || 45, fontSize: 12, theme, disableStdin: true, scrollback: 2000, convertEol: false, allowProposedApi: true });
+      term.open(el.querySelector('.term'));
+      card = { name: st.name, el, term, ws: null, alive: false };
+      cards.set(st.name, card); grid.appendChild(el); io.observe(el);
+      el.addEventListener('click', () => openFocus(card));
+      requestAnimationFrame(() => scaleTerm(card));
+    }
+    const wasAlive = card.alive; card.alive = !!st.alive; card.st = st;
+    if (wasAlive && !card.alive) { disconnect(card); }
+    const el = card.el;
+    el.dataset.state = st.state; el.dataset.head = st.head || '';
+    el.querySelector('.name').textContent = st.name;
+    el.querySelector('.meta').textContent = [st.head, st.kind, st.model, 'pid ' + st.pid, 'quiet ' + fmtQuiet(st.lastOutputAt), (st.viewers ? st.viewers + ' viewing' : '')].filter(Boolean).join(' · ');
+    el.querySelector('.state').textContent = st.state + (st.why ? ' · ' + st.why : '');
+    el.querySelector('.label').textContent = st.label || '';
+    el.querySelector('.label').title = st.label || '';
+    if ((st.cols && st.cols !== card.term.cols) || (st.rows && st.rows !== card.term.rows)) { card.term.resize(st.cols, st.rows); requestAnimationFrame(() => scaleTerm(card)); }
+    const visible = (headFilter === 'all' || st.head === headFilter) && (stateFilter === 'all' || st.state === stateFilter);
+    el.style.display = visible ? '' : 'none';
+  }
+
+  let heads = new Set();
+  async function refresh() {
+    try {
+      const lanes = await (await fetch('/api/lanes')).json();
+      lanes.sort((a, b) => (a.started || '').localeCompare(b.started || ''));
+      const seen = new Set();
+      for (const st of lanes) { seen.add(st.name); heads.add(st.head); ensureCard(st); }
+      for (const [name, card] of cards) if (!seen.has(name)) { disconnect(card); card.el.remove(); cards.delete(name); }
+      const alive = lanes.filter(l => l.alive).length, needs = lanes.filter(l => l.state === 'needs-input').length;
+      document.getElementById('count').textContent = lanes.length + ' lanes · ' + alive + ' alive · ' + needs + ' need input';
+      document.title = (needs ? '(' + needs + ') ' : '') + 'lanes';
+      renderHeads();
+      if (!lanes.length) grid.innerHTML = '<div class="empty">no lanes yet — launch one: lane launch --name api --kind claude --cwd C:\\src\\myapp --prompt &quot;Add a health endpoint.&quot;</div>';
+    } catch (e) { }
+    try {
+      const h = headFilter === 'all' ? [...heads] : [headFilter];
+      let rows = [];
+      for (const hd of h) { if (!hd) continue; const r = await (await fetch('/api/events?head=' + encodeURIComponent(hd) + '&n=30')).json(); rows = rows.concat(r); }
+      rows.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+      document.getElementById('events').innerHTML = rows.slice(0, 30).map(r => '<span class="ev">' + esc((r.ts || '').replace('T', ' ').slice(11, 19)) + '  <b>' + esc(r.lane) + '</b>  ' + esc((r.state || '').toUpperCase()) + '(' + esc(r.why || '') + ')  ' + esc((r.label || '').slice(0, 160)) + '</span>').join('');
+    } catch (e) { }
+  }
+  function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+  function renderHeads() {
+    const box = document.getElementById('heads'); const want = ['all', ...[...heads].filter(Boolean).sort()];
+    if (box.dataset.sig === want.join('|')) return; box.dataset.sig = want.join('|');
+    box.innerHTML = want.map(h => '<span class="chip' + (h === headFilter ? ' on' : '') + '" data-h="' + esc(h) + '">' + esc(h) + '</span>').join('');
+    box.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => { headFilter = c.dataset.h; box.dataset.sig = ''; renderHeads(); for (const card of cards.values()) ensureCard(card.st); }));
+  }
+  document.querySelectorAll('#states .chip').forEach(c => c.addEventListener('click', () => { stateFilter = c.dataset.f; document.querySelectorAll('#states .chip').forEach(x => x.classList.toggle('on', x === c)); for (const card of cards.values()) ensureCard(card.st); }));
+  window.addEventListener('resize', () => { for (const card of cards.values()) scaleTerm(card); });
+
+  // focus view: a full-size terminal that types into the lane; resizes the PTY to its own size while open.
+  const focus = document.getElementById('focus'); let fterm = null, fws = null, ffit = null, fcard = null;
+  function openFocus(card) {
+    fcard = card; focus.classList.add('on');
+    document.getElementById('fname').textContent = card.name;
+    document.getElementById('fmeta').textContent = card.el.querySelector('.meta').textContent;
+    if (!fterm) { fterm = new Terminal({ fontSize: 13, theme, scrollback: 10000, allowProposedApi: true }); ffit = new FitAddon.FitAddon(); fterm.loadAddon(ffit); fterm.open(document.getElementById('focusterm')); fterm.onData(d => { if (fws && fws.readyState === 1) fws.send(new TextEncoder().encode(d)); }); }
+    fterm.reset(); ffit.fit();
+    if (fws) { try { fws.close(); } catch {} }
+    fws = new WebSocket('ws://' + location.host + '/ws/' + encodeURIComponent(card.name) + '?tail=262144'); fws.binaryType = 'arraybuffer';
+    fws.onopen = () => { fws.send(JSON.stringify({ resize: [fterm.cols, fterm.rows] })); };
+    fws.onmessage = e => { if (typeof e.data === 'string') { try { const m = JSON.parse(e.data); if (m.exit !== undefined) fterm.write('\r\n\x1b[36m[lane exited ' + m.exit + ']\x1b[0m\r\n'); } catch {} } else fterm.write(new Uint8Array(e.data)); };
+    setTimeout(() => fterm.focus(), 50);
+  }
+  function closeFocus() { focus.classList.remove('on'); if (fws) { try { fws.close(); } catch {} fws = null; } fcard = null; }
+  document.getElementById('fclose').addEventListener('click', closeFocus);
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && focus.classList.contains('on') && document.activeElement === document.getElementById('finput')) closeFocus(); });
+  focus.addEventListener('click', e => { if (e.target === focus) closeFocus(); });
+  function sendLine() { const inp = document.getElementById('finput'); if (!inp.value || !fcard) return; fetch('/api/send/' + encodeURIComponent(fcard.name), { method: 'POST', body: new TextEncoder().encode(inp.value + '\r') }); inp.value = ''; }
+  document.getElementById('fsend').addEventListener('click', sendLine);
+  document.getElementById('finput').addEventListener('keydown', e => { if (e.key === 'Enter') sendLine(); });
+  window.addEventListener('resize', () => { if (fterm && focus.classList.contains('on')) { ffit.fit(); if (fws && fws.readyState === 1) fws.send(JSON.stringify({ resize: [fterm.cols, fterm.rows] })); } });
+
+  refresh(); setInterval(refresh, 2000);
+})();
+</script>
+</body>
+</html>

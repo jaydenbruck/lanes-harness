@@ -1,0 +1,3 @@
+*.sh text eol=lf
+mac/*.py text eol=lf
+mac/tests/*.py text eol=lf
