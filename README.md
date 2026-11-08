@@ -108,6 +108,8 @@ Generic `other` parents need a turn-complete hook to distinguish their message p
 `lane stats` returns aggregate counts from the retained local registry and event queues, including
 launches by provider/month, restarts, and event reasons. Tests and name reuse are included. It does not
 print prompts, commands, transcript text or event labels, and does not infer permission decisions.
+Each consumer starts at the beginning of its retained queue and keeps its own cursor when draining it,
+so events that arrived before its first `lane wait` remain visible.
 
 ```
 lane launch --name N --kind claude|codex|grok|cursor|other [--model M] [--effort LEVEL] [--cwd DIR]

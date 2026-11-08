@@ -45,7 +45,7 @@ function Get-LaneUsage {
         $date = if ($row.launchedAt -is [datetime]) { $row.launchedAt.ToString("yyyy-MM-dd") } else { [string]$row.launchedAt }; $k = $date.Substring(0, [math]::Min(7, $date.Length)); $months[$k] = 1 + [int]$months[$k]
     }
     foreach ($row in $events) { $k = "$($row.state)/$($row.why)"; $reasons[$k] = 1 + [int]$reasons[$k] }
-    [ordered]@{ launches = $launches.Count; uniqueNames = @($launches.name | Sort-Object -Unique).Count
+    [ordered]@{ launches = $launches.Count; uniqueNames = @($launches | ForEach-Object { $_.name } | Sort-Object -Unique).Count
         restarts = @($launches | Where-Object { $_.restartOf }).Count; byKind = $kinds; byMonth = $months
         events = $events.Count; byStateReason = $reasons; invalidRows = $invalid
         note = 'Retained local records only. Restarts and tests count as launches; events can repeat. No approval outcome is inferred.' }
@@ -464,7 +464,7 @@ function Start-Lane {
             $parent = Get-LaneState $ParentLane
             if (-not $parent -or -not $parent.alive) { throw "parent lane '$ParentLane' is not alive" }
             Assert-LaneDriveable $ParentLane $parent
-            if ($parent.meta -and $parent.meta.inbox) { $ParentInbox = $parent.meta.inbox }
+            if ($parent['meta'] -and $parent['meta']['inbox']) { $ParentInbox = $parent['meta']['inbox'] }
             else { Write-Warning "parent '$ParentLane' uses an older host; notifications remain in lane events" }
         }
     } else { $ParentLane = ''; $ParentInbox = '' }
@@ -956,11 +956,11 @@ function Restart-Lane {
     $args = @{ Name = $Name; Kind = $launch.kind; Model = $launch.model; Effort = $recordedEffort; Cwd = $launch.cwd; Head = $launch.head; Brief = $launch.brief; Prompt = $p
         Cols = $launch.cols; Rows = $launch.rows; StallMinutes = $launch.stallMinutes; ResumeSession = $resume
         RestartOf = $(if ($launch.restartOf) { $launch.restartOf } else { $Name }); RestartCount = ([int]$launch.restartCount + 1); KeepLog = $true; Force = $Force }
-    $args.ParentLane = if ($launch.parentLane) { $launch.parentLane } else { 'none' }
-    if ($launch.parentInbox) { $args.ParentInbox = $launch.parentInbox }
-    if ($launch.permissions) { $args.Permissions = $launch.permissions }
-    if (-not $Fresh -and $launch.inbox) { $args.Inbox = $launch.inbox }
-    if ($launch.extraArgs -and $launch.kind -ne 'other') { $args.ExtraArgs = @($launch.extraArgs) }
+    $args.ParentLane = if ($launch['parentLane']) { $launch['parentLane'] } else { 'none' }
+    if ($launch['parentInbox']) { $args.ParentInbox = $launch['parentInbox'] }
+    if ($launch['permissions']) { $args.Permissions = $launch['permissions'] }
+    if (-not $Fresh -and $launch['inbox']) { $args.Inbox = $launch['inbox'] }
+    if ($launch['extraArgs'] -and $launch.kind -ne 'other') { $args.ExtraArgs = @($launch['extraArgs']) }
     if ($launch.kind -eq 'other') { $args.Command = $launch.cmd; $args.Prompt = '' }
     if ($launch.isHead) { $args.IsHead = $true }
     if ($launch.visible) { $args.Visible = $true } else { $args.Hidden = $true }
@@ -993,11 +993,6 @@ function Get-LaneEvent {
     $cursor = 0
     if (-not $All) {
         if (Test-Path -LiteralPath $cf) { $cursor = [long](Get-Content -LiteralPath $cf -Raw).Trim() }
-        elseif ($As -ne 'user' -and $As -ne $Head) {
-            # a consumer that has never drained starts now: history before it existed is not owed to it (--all reads it)
-            $cursor = (Get-Item -LiteralPath $qf).Length
-            New-Item -ItemType Directory -Force (Split-Path $cf) | Out-Null; Set-Content -LiteralPath $cf -Value ([string]$cursor) -NoNewline
-        }
     }
     $fs = [IO.FileStream]::new($qf, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
     try {

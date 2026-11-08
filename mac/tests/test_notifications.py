@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import types
+import time
 import unittest
 from unittest.mock import patch
 
@@ -74,6 +75,49 @@ class Notifications(unittest.TestCase):
             self.assertEqual(lane.parse(args, ["name"], {"force"}, message=True)["_rest"], text)
         with patch.dict(os.environ, {"LANES_HEAD": "head", "LANES_LANE": "sibling"}):
             self.assertEqual(lane.current_consumer(), "sibling")
+
+    def test_stale_cursor_prompt_does_not_answer_dialog(self):
+        self.host.kind = "cursor"
+        for text in ("Old answer\nAdd a follow-up\n" + "dialog\n" * 8 + "Do you want to run this command?\nEnter to confirm\n",
+                     "Add a follow-up\nAllow this command\n", "Add a follow-up  ctrl+c to stop\n"):
+            self.host.tail = bytearray(text.encode())
+            self.host.state, self.host.why = "needs-input", "prompt"
+            with patch.object(self.host, "write_paste") as send:
+                self.host.poll_inbox()
+                send.assert_not_called()
+
+    def test_raw_enter_clears_old_completion(self):
+        self.host.state, self.host.why = "needs-input", "turn-complete"
+        self.host.idle_at_prompt = True
+        self.host.hook_turn_done = True
+        with patch.object(self.host, "audit_input"), patch.object(lanehost.os, "write"):
+            self.host.write_input(b"\r")
+        self.assertFalse(self.host.idle_at_prompt)
+        self.assertFalse(self.host.hook_turn_done)
+        self.host.pending_input = False  # the subsequent output-loop transition
+        self.host.last_output = time.monotonic() - 10
+        self.host._tick()
+        with patch.object(self.host, "write_paste") as send:
+            self.host.poll_inbox()
+            send.assert_not_called()
+
+    def test_raw_draft_defers_even_at_idle_prompt(self):
+        self.host.state, self.host.why = "needs-input", "turn-complete"
+        with patch.object(self.host, "audit_input"), patch.object(lanehost.os, "write"):
+            self.host.write_input(b"unfinished draft")
+        self.host.pending_input = False
+        with patch.object(self.host, "write_paste") as send:
+            self.host.poll_inbox()
+            send.assert_not_called()
+
+    def test_first_consumer_read_retains_completed_event(self):
+        head = self.path / "heads" / "head"
+        head.mkdir(parents=True)
+        (head / "events.jsonl").write_text(json.dumps(dict(self.event, ts=lc.now_iso(), head="head")) + "\n", encoding="utf-8")
+        with patch.dict(os.environ, {"LANES_HOME": str(self.path), "LANES_HEADS_ROOT": str(self.path / "heads"),
+                                    "LANES_HEAD": "head", "LANES_LANE": "helper"}), patch.object(lane, "get_lanes", return_value=[]):
+            rows = lane.get_events(drain=True, as_object=True)
+        self.assertEqual(len(rows), 1)
 
 
 if __name__ == "__main__":

@@ -713,11 +713,6 @@ def get_events(drain=False, peek=False, max_rows=200, head="", as_object=False, 
                 cursor = int(open(cf).read().strip() or 0)
             except ValueError:
                 cursor = 0
-        elif consumer not in ("user", head):
-            cursor = os.path.getsize(qf)   # a new consumer starts now; --all reads history
-            os.makedirs(os.path.dirname(cf), exist_ok=True)
-            with open(cf, "w") as f:
-                f.write(str(cursor))
     size = os.path.getsize(qf)
     if cursor > size:
         cursor = 0   # the queue was truncated; start over

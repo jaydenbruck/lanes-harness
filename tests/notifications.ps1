@@ -45,6 +45,27 @@ try {
     $env:LANES_LANE = 'sibling'; $env:LANES_HEAD = 'test-head'
     Assert ((Get-CurrentConsumer) -eq 'sibling') 'siblings have independent event cursors'
     $env:LANES_LANE = $null
+    Hook parent @{ hook_event_name = 'Stop'; last_assistant_message = 'Ready before draft' }
+    Wait-Until { (Get-LaneState parent).why -eq 'turn-complete' }
+    Send-Lane parent 'unfinished draft' -Raw
+    $r = Restart-Lane child
+    $before = Received parent
+    Start-Sleep -Seconds 5
+    Assert ((Received parent) -eq $before) 'raw draft defers notification'
+    Send-Lane parent -Key enter
+    Wait-Until { (Received parent) -match 'unfinished draft' }
+    $before = Received parent
+    Start-Sleep -Seconds 5
+    Assert ((Received parent) -eq $before) 'raw Enter starts a busy turn without stale completion'
+    Hook parent @{ hook_event_name = 'Stop'; last_assistant_message = 'New turn finished' }
+    Wait-Until { (Received parent).Length -gt $before.Length }
+    $before = Received parent
+    Stop-Lane parent -Hard | Out-Null
+    Restart-Lane parent | Out-Null
+    Hook parent @{ hook_event_name = 'Stop'; last_assistant_message = 'Resumed parent' }
+    Wait-Until { (Get-LaneState parent).why -eq 'turn-complete' }
+    Start-Sleep -Seconds 2
+    Assert ((Received parent) -eq $before) 'parent restart preserves delivery cursor without replay'
     $r = Restart-Lane child
     $launch2 = Read-JsonFile (Join-Path (Get-LanesRoot) 'child\launch.json')
     Assert ($launch2.parentInbox -eq $launch.parentInbox -and $launch2.permissions -eq 'default') 'restart preserves parent generation and permission mode'
@@ -56,7 +77,7 @@ try {
     Start-Sleep -Seconds 2
     Assert (-not (Received parent)) 'reused parent name does not receive stale notifications'
     $stats = Get-LaneUsage
-    Assert ($stats.launches -eq 4 -and $stats.restarts -eq 1) 'usage counts launches and restarts'
+    Assert ($stats.launches -eq 6 -and $stats.restarts -eq 3) 'usage counts launches and restarts'
     'All notification checks passed'
 } finally {
     $env:LANES_LANE = $null

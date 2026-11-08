@@ -572,6 +572,7 @@ namespace LanesHarness
         Regex promptRx, runningRx, errorRx;
         int restartCount = 0; string restartOf = "";
         bool pendingInput = false;  // input written while waiting: the next output proves the turn restarted
+        volatile bool inputDraft = false;
         long lastStateChange = 0;
         volatile bool hookTurnDone = false;  // claude/grok Stop or codex turn-ended seen since the last input
         volatile bool hookSeen = false;      // whether this lane speaks hooks at all (then patterns take a back seat)
@@ -820,6 +821,7 @@ namespace LanesHarness
             lock (inputLock)
             {
                 AuditInput("paste", bodyLen, submit);
+                inputDraft = !submit;
                 if (submit) { idleAtPrompt = false; hookTurnDone = false; }
                 try
                 {
@@ -867,6 +869,10 @@ namespace LanesHarness
             lock (inputLock)
             {
                 AuditInput("raw", len, false);
+                bool submit = false;
+                for (int i = off; i < off + len; i++) if (data[i] == 13 || data[i] == 10) submit = true;
+                inputDraft = !submit;
+                if (submit) { idleAtPrompt = false; hookTurnDone = false; SetState("running", "raw-submitted", "", false); }
                 try { pty.Input.Write(data, off, len); pty.Input.Flush(); } catch { }
                 lastInputAt = Stopwatch.GetTimestamp();
                 pendingInput = true;
@@ -932,9 +938,9 @@ namespace LanesHarness
             if (string.IsNullOrEmpty(inboxPath) || !File.Exists(inboxPath)) return;
             lock (inputLock)
             {
-                if (pendingInput || state != "needs-input" ||
+                if (pendingInput || inputDraft || state != "needs-input" ||
                     !(why == "turn-complete" || why == "idle" ||
-                      (kind == "cursor" && why == "prompt" && TailText().Contains("Add a follow-up")))) return;
+                      (kind == "cursor" && why == "prompt" && CursorMessagePromptReady(TailText())))) return;
                 byte[] data;
                 using (var fs = new FileStream(inboxPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                 {
@@ -1037,6 +1043,15 @@ namespace LanesHarness
         // Cursor's idle screen ends in its own chrome (follow-up box, model line, cwd). The label should be
         // what the agent said, so skip the chrome and keep the last few lines above it.
         static readonly Regex CursorChromeRx = new Regex(@"Add a follow-up|Run Everything|ctrl\+c to stop|^\s*Tip:|^[\u2800-\u28FF\s]*Working\b|Working\s+\d+ tokens|^\s*~[\\/]|^\s*[A-Za-z]:\\", RegexOptions.IgnoreCase);
+        static bool CursorMessagePromptReady(string tail)
+        {
+            var lines = Vt.TailLines(tail, 8);
+            string current = string.Join("\n", lines.ToArray());
+            return current.Contains("Add a follow-up") &&
+                current.IndexOf("ctrl+c to stop", StringComparison.OrdinalIgnoreCase) < 0 &&
+                !QuestionRx.IsMatch(current) &&
+                !Regex.IsMatch(current, @"\b(permission|approve|allow|trust)\b", RegexOptions.IgnoreCase);
+        }
         static string CursorReplyFromTail(string tail)
         {
             var lines = Vt.TailLines(tail, 20); var keep = new List<string>();
@@ -1089,6 +1104,7 @@ namespace LanesHarness
             string tid = Json.GetStr(o, "thread-id"); if (string.IsNullOrEmpty(tid)) tid = Json.GetStr(o, "thread_id"); if (!string.IsNullOrEmpty(tid)) sessionIdSeen = tid;
             if (evKey == "stop")
             {
+                inputDraft = false;
                 string m = Json.GetStr(o, "last_assistant_message");
                 if (string.IsNullOrEmpty(m)) m = Json.GetStr(o, "lastAssistantMessage");
                 if (string.IsNullOrEmpty(m)) m = LastAssistantFromTranscript();
@@ -1097,6 +1113,7 @@ namespace LanesHarness
             }
             else if (ty == "agent-turn-complete")
             {
+                inputDraft = false;
                 string m = Json.GetStr(o, "last-assistant-message"); if (m == null) m = Json.GetStr(o, "last_assistant_message");
                 lastAssistant = m ?? "";
                 hookTurnDone = true; idleAtPrompt = true;

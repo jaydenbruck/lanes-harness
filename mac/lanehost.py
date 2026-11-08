@@ -150,6 +150,7 @@ class Host:
         self.last_assistant = ""
         self.transcript = ""
         self.session_seen = ""
+        self.input_draft = False
         self.pending_input = False
         self.hook_turn_done = False
         self.hook_seen = False
@@ -330,6 +331,11 @@ class Host:
             return
         with self.input_lock:
             self.audit_input("raw", len(data), False)
+            submit = b"\r" in data or b"\n" in data
+            self.input_draft = not submit
+            if submit:
+                self.idle_at_prompt = self.hook_turn_done = False
+                self.set_state("running", "raw-submitted", "", False)
             try:
                 os.write(self.master, data)
             except OSError:
@@ -342,6 +348,7 @@ class Host:
         body = text[:-1] if submit else text
         with self.input_lock:
             self.audit_input("paste", len(body), submit)
+            self.input_draft = not submit
             if submit:
                 self.idle_at_prompt = self.hook_turn_done = False
             try:
@@ -405,9 +412,9 @@ class Host:
         if not self.inbox_path or not os.path.exists(self.inbox_path):
             return
         with self.input_lock:
-            if self.pending_input or self.state != "needs-input" or not (
+            if self.pending_input or self.input_draft or self.state != "needs-input" or not (
                 self.why in ("turn-complete", "idle") or
-                (self.kind == "cursor" and self.why == "prompt" and "Add a follow-up" in self.tail_text())
+                (self.kind == "cursor" and self.why == "prompt" and self.cursor_message_prompt_ready(self.tail_text()))
             ):
                 return
             with open(self.inbox_path, "rb") as f:
@@ -501,6 +508,12 @@ class Host:
         return " | ".join(lines)
 
     @staticmethod
+    def cursor_message_prompt_ready(t):
+        current = "\n".join(lc.tail_lines(t, 8))
+        return ("Add a follow-up" in current and "ctrl+c to stop" not in current.lower() and
+                not QUESTION_RX.search(current) and not re.search(r"\b(permission|approve|allow|trust)\b", current, re.I))
+
+    @staticmethod
     def cursor_reply(t):
         keep = [s for s in (l.strip() for l in lc.tail_lines(t, 20)) if s and not CURSOR_CHROME_RX.search(s)]
         return " | ".join(keep[-3:]) if keep else " | ".join(lc.tail_lines(t, 4))
@@ -545,10 +558,12 @@ class Host:
             self.session_seen = tid
         tool = _gs(o, "tool_name", "toolName") or ""
         if key == "stop":
+            self.input_draft = False
             m = _gs(o, "last_assistant_message", "lastAssistantMessage") or self.last_assistant_from_transcript()
             self.last_assistant = m or ""
             self.hook_turn_done = self.idle_at_prompt = True
         elif ty == "agent-turn-complete":
+            self.input_draft = False
             self.last_assistant = _gs(o, "last-assistant-message", "last_assistant_message") or ""
             self.hook_turn_done = self.idle_at_prompt = True
         elif key == "notification":
