@@ -17,7 +17,10 @@ function Hook($name, $payload) {
 }
 function Received($name) {
     $path = Join-Path (Get-LanesRoot) $name 'received.jsonl'
-    if (Test-Path $path) { return [IO.File]::ReadAllText($path) }; return ''
+    if (-not (Test-Path $path)) { return '' }
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    $reader = [IO.StreamReader]::new($stream)
+    try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
 }
 try {
     $p = Start-Lane parent -Kind other -Command ('"' + $python + '" "' + $fake + '"') -Hidden
@@ -35,6 +38,9 @@ try {
     Hook parent @{ hook_event_name = 'UserPromptSubmit' }
     Hook parent @{ hook_event_name = 'Stop'; last_assistant_message = 'Ready for next instruction' }
     Wait-Until { (Received parent) -match 'child finished' }
+    $capture = [IO.File]::Open((Join-Path (Get-LanesRoot) 'parent\received.jsonl'), [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try { Assert ((Received parent) -match 'child finished') 'capture reader permits an active writer' }
+    finally { $capture.Dispose() }
     Assert ((Received parent) -match '\\u001b\[200~') 'notification uses bracketed paste'
     $env:LANES_LANE = $null
     & (Join-Path $repo 'lane.ps1') send parent 'Run the command' '--example' 'value'
