@@ -144,7 +144,7 @@ if (Run 2) {
 # ---------------------------------------------------------------------------------------------------
 # T3 · dies mid-turn — DIED fires, restart resumes with context
 # ---------------------------------------------------------------------------------------------------
-if (Run 3 -and -not $SkipReal) {
+if ((Run 3) -and -not $SkipReal) {
     $name = 'g-die'
     $st = Start-Lane -Name $name -Kind claude -Model $RealModel -Cwd (Join-Path $Scratch 't1') -Hidden -Prompt "We are setting up a small project. Its codename is MANGO-88; I will refer to it by that name later. Reply with exactly: noted."
     $trust = WaitEvent $name 'needs-input' 25 'prompt'; if ($trust -and $trust.label -match 'trust') { AcceptTrust $name }
@@ -421,7 +421,7 @@ if (Run 13) {
 # ---------------------------------------------------------------------------------------------------
 # G · real Grok Build: launch/read/send/kill/events
 # ---------------------------------------------------------------------------------------------------
-if (Run 14 -and -not $SkipReal -and -not $SkipGrok) {
+if ((Run 14) -and -not $SkipReal -and -not $SkipGrok) {
     $name = 'g-grok-real'; $work = Join-Path $Scratch 'grok-real'; New-Item -ItemType Directory -Force $work | Out-Null
     $witness = Join-Path $work 'grok-lane-witness.txt'; Remove-Item -LiteralPath $witness -Force -ErrorAction SilentlyContinue
     $st = Start-Lane -Name $name -Kind grok -Model $GrokModel -ExtraArgs @('--reasoning-effort', $GrokEffort) -Cwd $work -Hidden -StallMinutes 3 -Prompt 'Create grok-lane-witness.txt containing exactly GROK_GAUNTLET, then reply with exactly GROK_FIRST_DONE.'

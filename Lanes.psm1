@@ -26,6 +26,31 @@ function Get-LanesHome { $script:LanesHome }
 function Get-LanesRoot { $script:Root }
 function Get-LaneHeadsRoot { $script:HeadsRoot }
 
+function Get-LaneUsage {
+    # Counts only. Prompts, commands, paths, event labels and transcripts are never returned.
+    $launches = @(); $events = @(); $invalid = 0
+    $files = @((Join-Path $script:Root '_registry.jsonl')) + @(Get-ChildItem $script:HeadsRoot -Filter events.jsonl -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
+    foreach ($file in $files) {
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        foreach ($line in [IO.File]::ReadLines($file)) {
+            if (-not $line.Trim()) { continue }
+            try { $row = $line | ConvertFrom-Json -AsHashtable -ErrorAction Stop }
+            catch { $invalid++; continue }
+            if ($file -eq $files[0]) { $launches += $row } else { $events += $row }
+        }
+    }
+    $kinds = @{}; $months = @{}; $reasons = @{}
+    foreach ($row in $launches) {
+        $k = [string]$row.kind; $kinds[$k] = 1 + [int]$kinds[$k]
+        $date = if ($row.launchedAt -is [datetime]) { $row.launchedAt.ToString("yyyy-MM-dd") } else { [string]$row.launchedAt }; $k = $date.Substring(0, [math]::Min(7, $date.Length)); $months[$k] = 1 + [int]$months[$k]
+    }
+    foreach ($row in $events) { $k = "$($row.state)/$($row.why)"; $reasons[$k] = 1 + [int]$reasons[$k] }
+    [ordered]@{ launches = $launches.Count; uniqueNames = @($launches | ForEach-Object { $_.name } | Sort-Object -Unique).Count
+        restarts = @($launches | Where-Object { $_.restartOf }).Count; byKind = $kinds; byMonth = $months
+        events = $events.Count; byStateReason = $reasons; invalidRows = $invalid
+        note = 'Retained local records only. Restarts and tests count as launches; events can repeat. No approval outcome is inferred.' }
+}
+
 # ---------------------------------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------------------------------
@@ -40,8 +65,8 @@ function Get-CurrentConsumer {
     # Two sessions that share a head identity therefore still keep separate cursors: each sees every event once,
     # and neither can mark the other's unseen rows as seen.
     if ($env:LANES_CONSUMER) { return $env:LANES_CONSUMER }
-    if ($env:LANES_HEAD -and $env:LANES_HEAD -ne 'user') { return $env:LANES_HEAD }
     if ($env:LANES_LANE) { return $env:LANES_LANE }
+    if ($env:LANES_HEAD -and $env:LANES_HEAD -ne 'user') { return $env:LANES_HEAD }
     return 'user'
 }
 
@@ -144,6 +169,7 @@ function Get-LaneState([string]$Name) {
                 $row = [ordered]@{ ts = (Get-Date).ToUniversalTime().ToString('o'); head = $st.head; lane = $Name; state = 'died'; why = 'host-lost'
                     label = $st.label; from = $st.episodeStart; to = $st.bytes; pid = $st.pid; exit = $null; kind = $st.kind; model = $st.model; cwd = $st.cwd; hostPid = $st.hostPid; n = 0 }
                 Append-Line (Join-Path $script:HeadsRoot $st.head 'events.jsonl') ($row | ConvertTo-Json -Compress)
+                if ($st.meta -and $st.meta.parentInbox) { Append-Line $st.meta.parentInbox ($row | ConvertTo-Json -Compress) }
             } catch { }
         }
     }
@@ -411,6 +437,10 @@ function Start-Lane {
         [string[]]$ExtraArgs = @(),
         [ValidatePattern('^[a-z][a-z0-9_-]*$')][string]$Effort = 'high',
         [string]$Head = '',             # owner; defaults to the current head ($env:LANES_HEAD or 'user')
+        [string]$ParentLane = $env:LANES_LANE,
+        [string]$ParentInbox = '',      # pinned to the launching parent's generation; preserved on child restart
+        [string]$Inbox = '',            # reuse the session's mailbox on restart, including its delivery cursor
+        [ValidateSet('bypass', 'default')][string]$Permissions = 'bypass',
         [switch]$IsHead,                # this lane IS a head agent: registers it (LANES_MAX_HEADS, default 2), sets LANES_HEAD inside it
         [switch]$Visible, [switch]$Hidden,
         [int]$Cols = 160, [int]$Rows = 45,
@@ -426,6 +456,18 @@ function Start-Lane {
     if (-not (Test-Path -LiteralPath $Cwd -PathType Container)) { throw "cwd '$Cwd' does not exist" }
     $Cwd = (Resolve-Path -LiteralPath $Cwd).Path
     if (-not $Head) { $Head = Get-CurrentHead }
+    Test-LaneName $Head
+    if ($ParentLane -and $ParentLane -ne 'none') {
+        Test-LaneName $ParentLane
+        if ($ParentLane -eq $Name) { throw 'a lane cannot be its own parent' }
+        if (-not $ParentInbox) {
+            $parent = Get-LaneState $ParentLane
+            if (-not $parent -or -not $parent.alive) { throw "parent lane '$ParentLane' is not alive" }
+            Assert-LaneDriveable $ParentLane $parent
+            if ($parent['meta'] -and $parent['meta']['inbox']) { $ParentInbox = $parent['meta']['inbox'] }
+            else { Write-Warning "parent '$ParentLane' uses an older host; notifications remain in lane events" }
+        }
+    } else { $ParentLane = ''; $ParentInbox = '' }
     if ($IsHead) {
         # The human launches head agents; the head lane is owned by 'user' and registered.
         $null = Register-LaneHead -Name $Name -Lane $Name -Force:$Force
@@ -472,7 +514,8 @@ function Start-Lane {
     }
     elseif ($Kind -eq 'claude') {
         $settings = New-ClaudeHookSettings $laneDir
-        $parts = @((Resolve-LaneExe 'claude'), '--dangerously-skip-permissions')
+        $parts = @((Resolve-LaneExe 'claude'))
+        if ($Permissions -eq 'bypass') { $parts += '--dangerously-skip-permissions' }
         if ($Model) { $parts += @('--model', $Model) }
         if ($ResumeSession) { $parts += @('--resume', $ResumeSession); $sessionId = $ResumeSession }
         else { $sessionId = [guid]::NewGuid().ToString(); $parts += @('--session-id', $sessionId) }
@@ -485,7 +528,7 @@ function Start-Lane {
         $notify = "notify=['" + $script:Exe + "','hook','" + $laneDir + "']"
         $codex = Resolve-LaneExe 'codex'
         if ($ResumeSession) { $parts = @($codex, 'resume', $ResumeSession) } else { $parts = @($codex) }
-        $parts += @('--yolo')
+        if ($Permissions -eq 'bypass') { $parts += '--yolo' }
         if ($Model) { $parts += @('-m', $Model) }
         $parts += @('-c', $notify, '-C', $Cwd)
         $parts += $ExtraArgs
@@ -497,7 +540,8 @@ function Start-Lane {
     elseif ($Kind -eq 'grok') {
         if (Test-LanesStrictPrivacy) { $null = Assert-GrokDataSharingOptOut }
         $null = Install-GrokLaneHooks
-        $parts = @((Resolve-LaneExe 'grok'), '--no-alt-screen', '--permission-mode', 'bypassPermissions')
+        $parts = @((Resolve-LaneExe 'grok'), '--no-alt-screen')
+        if ($Permissions -eq 'bypass') { $parts += @('--permission-mode', 'bypassPermissions') }
         if ($Model) { $parts += @('--model', $Model) }
         if ($ResumeSession) { $parts += @('--resume', $ResumeSession); $sessionId = $ResumeSession }
         else { $sessionId = [guid]::NewGuid().ToString(); $parts += @('--session-id', $sessionId) }
@@ -516,7 +560,8 @@ function Start-Lane {
         # claude's --dangerously-skip-permissions and grok's bypassPermissions, which every
         # other kind here already passes. --trust answers the workspace-trust prompt that
         # would otherwise block a headless lane on its first turn forever.
-        $parts = @($ca.Node, $ca.Entry, '--force', '--trust', '--workspace', $Cwd)
+        $parts = @($ca.Node, $ca.Entry, '--workspace', $Cwd)
+        if ($Permissions -eq 'bypass') { $parts += @('--force', '--trust') }
         if ($Model) { $parts += @('--model', $Model) }
         # Cursor mints its own chat id. Unlike claude and grok there is no --session-id to
         # pre-seed, so a fresh lane has no id until Cursor makes one; resuming is by the id
@@ -530,7 +575,11 @@ function Start-Lane {
     }
     else { throw "-Kind other needs -Command" }
 
-    $meta = [ordered]@{ isHead = [bool]$IsHead; visible = $null; launchedBy = Get-CurrentHead; launcherPid = $PID }
+    if (-not $Inbox) { $Inbox = Join-Path $laneDir ('inbox\' + [guid]::NewGuid().ToString('N') + '.jsonl') }
+    $inbox = $Inbox
+    New-Item -ItemType Directory -Force (Split-Path -Parent $inbox) | Out-Null
+    $meta = [ordered]@{ isHead = [bool]$IsHead; visible = $null; launchedBy = Get-CurrentHead; launcherPid = $PID
+        parentLane = $ParentLane; parentInbox = $ParentInbox; inbox = $inbox; permissions = $Permissions }
     $showTab = if ($Visible) { $true } elseif ($Hidden) { $false } else { (@(Get-Lane | Where-Object { $_.alive }).Count -lt 10) }
     $meta.visible = $showTab
 
@@ -539,6 +588,8 @@ function Start-Lane {
         sessionId = $sessionId; cols = $Cols; rows = $Rows; stallMinutes = $StallMinutes; isHead = [bool]$IsHead; visible = $showTab
         restartOf = $RestartOf; restartCount = $RestartCount; launchedBy = (Get-CurrentHead); launcherPid = $PID
         strictPrivacy = [bool](Test-LanesStrictPrivacy)
+        parentLane = $ParentLane; parentInbox = $ParentInbox; permissions = $Permissions; extraArgs = $ExtraArgs
+        inbox = $Inbox
         launchedAt = (Get-Date).ToUniversalTime().ToString('o'); exe = $script:Exe
     }
     Write-JsonFile (Join-Path $laneDir 'launch.json') $launch
@@ -905,6 +956,11 @@ function Restart-Lane {
     $args = @{ Name = $Name; Kind = $launch.kind; Model = $launch.model; Effort = $recordedEffort; Cwd = $launch.cwd; Head = $launch.head; Brief = $launch.brief; Prompt = $p
         Cols = $launch.cols; Rows = $launch.rows; StallMinutes = $launch.stallMinutes; ResumeSession = $resume
         RestartOf = $(if ($launch.restartOf) { $launch.restartOf } else { $Name }); RestartCount = ([int]$launch.restartCount + 1); KeepLog = $true; Force = $Force }
+    $args.ParentLane = if ($launch['parentLane']) { $launch['parentLane'] } else { 'none' }
+    if ($launch['parentInbox']) { $args.ParentInbox = $launch['parentInbox'] }
+    if ($launch['permissions']) { $args.Permissions = $launch['permissions'] }
+    if (-not $Fresh -and $launch['inbox']) { $args.Inbox = $launch['inbox'] }
+    if ($launch['extraArgs'] -and $launch.kind -ne 'other') { $args.ExtraArgs = @($launch['extraArgs']) }
     if ($launch.kind -eq 'other') { $args.Command = $launch.cmd; $args.Prompt = '' }
     if ($launch.isHead) { $args.IsHead = $true }
     if ($launch.visible) { $args.Visible = $true } else { $args.Hidden = $true }
@@ -937,11 +993,6 @@ function Get-LaneEvent {
     $cursor = 0
     if (-not $All) {
         if (Test-Path -LiteralPath $cf) { $cursor = [long](Get-Content -LiteralPath $cf -Raw).Trim() }
-        elseif ($As -ne 'user' -and $As -ne $Head) {
-            # a consumer that has never drained starts now: history before it existed is not owed to it (--all reads it)
-            $cursor = (Get-Item -LiteralPath $qf).Length
-            New-Item -ItemType Directory -Force (Split-Path $cf) | Out-Null; Set-Content -LiteralPath $cf -Value ([string]$cursor) -NoNewline
-        }
     }
     $fs = [IO.FileStream]::new($qf, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
     try {
@@ -1034,4 +1085,4 @@ function Start-LaneViewer {
 }
 
 Set-Alias -Name lane-launch -Value Start-Lane
-Export-ModuleMember -Function Get-LanesHome, Test-LanesStrictPrivacy, ConvertTo-Utc, Get-CurrentConsumer, Get-CursorPath, Resolve-CursorAgent, Assert-CursorModelIsZeroRetention, Start-Lane, Get-Lane, Read-Lane, Send-Lane, Stop-Lane, Restart-Lane, Get-LaneEvent, Wait-LaneEvent, Open-LaneTab, Start-LaneViewer, Register-LaneHead, Get-LaneHead, Format-LaneTable, Get-LaneState, Get-CurrentHead, ConvertFrom-Vt, Send-LaneFrame, Get-LanesRoot, Get-LaneHeadsRoot, ConvertTo-ArgString, Append-Line, Read-JsonFile, Test-HostAlive, Assert-GrokDataSharingOptOut, Install-GrokLaneHooks, Get-CodexEffortArguments, Read-LaneEffortFromLog, Wait-LaneEffortReadback, Format-LaneEffortReadback, Get-LaneEffortReadbackTimeout, Get-LaneRestartEffort
+Export-ModuleMember -Function Get-LaneUsage, Get-LanesHome, Test-LanesStrictPrivacy, ConvertTo-Utc, Get-CurrentConsumer, Get-CursorPath, Resolve-CursorAgent, Assert-CursorModelIsZeroRetention, Start-Lane, Get-Lane, Read-Lane, Send-Lane, Stop-Lane, Restart-Lane, Get-LaneEvent, Wait-LaneEvent, Open-LaneTab, Start-LaneViewer, Register-LaneHead, Get-LaneHead, Format-LaneTable, Get-LaneState, Get-CurrentHead, ConvertFrom-Vt, Send-LaneFrame, Get-LanesRoot, Get-LaneHeadsRoot, ConvertTo-ArgString, Append-Line, Read-JsonFile, Test-HostAlive, Assert-GrokDataSharingOptOut, Install-GrokLaneHooks, Get-CodexEffortArguments, Read-LaneEffortFromLog, Wait-LaneEffortReadback, Format-LaneEffortReadback, Get-LaneEffortReadbackTimeout, Get-LaneRestartEffort

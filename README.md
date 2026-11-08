@@ -94,6 +94,23 @@ terminal afterwards.
 
 ## Commands
 
+Children launched inside a lane automatically notify the lane that launched them. The parent receives a
+submitted message containing the child's completion, question, permission, stall or exit label. Messages
+wait in a disk inbox while the parent is busy or displaying a question/permission dialog. Normal restarts
+keep the inbox and cursor. A fresh launch gets a new inbox, so old children cannot notify an unrelated
+session that reuses the name. The event queue remains available through `lane events` and `lane wait`.
+
+Use `--parent-lane NAME` when launching on behalf of a hosted parent, or `--parent-lane none` to disable
+push delivery. An agent running outside LANES has no terminal inbox managed by LANES and must use
+`lane wait --drain`. Older parent hosts also need an upgrade before they can receive pushed messages.
+Generic `other` parents need a turn-complete hook to distinguish their message prompt from a dialog.
+
+`lane stats` returns aggregate counts from the retained local registry and event queues, including
+launches by provider/month, restarts, and event reasons. Tests and name reuse are included. It does not
+print prompts, commands, transcript text or event labels, and does not infer permission decisions.
+Each consumer starts at the beginning of its retained queue and keeps its own cursor when draining it,
+so events that arrived before its first `lane wait` remain visible.
+
 ```
 lane launch --name N --kind claude|codex|grok|cursor|other [--model M] [--effort LEVEL] [--cwd DIR]
             [--brief PATH] [--prompt TEXT] [--command CMD] [--visible|--hidden] [--is-head]
@@ -121,8 +138,17 @@ On Windows the same verbs exist as PowerShell functions (`Import-Module .\Lanes.
 | `cursor` | `cursor-agent --force --trust --workspace <cwd>` | screen patterns and process state | relaunch on the original prompt |
 | `other` | whatever `--command` says | screen patterns and process state | relaunch |
 
-Lanes run their agents with permission prompts skipped, because nobody is at the keyboard to approve
-them. Only point lanes at work you would let that agent do unattended.
+`--permissions bypass` preserves the unattended default shown above. `--permissions default` omits
+LANES' bypass/trust flags and uses the provider's configured permission behavior. Both modes are recorded
+in `launch.json` and survive restarts, together with extra provider arguments. Provider configuration and
+explicit `--extra-args` still apply. LANES forwards permission requests to the parent and never answers
+them automatically. `input-audit.jsonl` records input time, size, mode and preceding state, without the
+message body. This records input attempts, not proof that an approval was granted or a tool succeeded.
+
+For `lane send`, put options before the message. Once message text begins, subsequent `--words` are
+literal text. Use `lane send NAME -- --force is literal` to start a message with an option name. In
+PowerShell, quote the standalone `'--'` when calling `lane.ps1` directly. `--file PATH` remains useful
+for long messages. Bracketed pastes include a separate Enter after the CLI has had time to process them.
 
 ## Configuration
 
@@ -152,6 +178,8 @@ holds no state: everything is on disk, so closing the terminal you launched lane
 pwsh -NoProfile -File tests\gauntlet.ps1 -SkipReal      # Windows, synthetic tests, no API usage
 pwsh -NoProfile -File tests\gauntlet.ps1                # Windows, adds real Claude (haiku) and Grok lanes
 python3 mac/tests/gauntlet.py                           # macOS / Linux, synthetic tests, no API usage
+pwsh -NoProfile -File tests\notifications.ps1            # Windows PTY parent delivery witness, needs Python
+python3 -m unittest discover -s mac/tests -p test_notifications.py
 ```
 
 Both run against a throwaway `LANES_HOME` in the temp folder: an output flood with nothing lost, question
