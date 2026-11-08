@@ -563,6 +563,8 @@ namespace LanesHarness
         long lastInputAt = 0;
         bool stalledReported = false; bool exited = false;
         string pipeName; string eventsPath, hooksPath;
+        string inboxPath, parentInbox, parentLane;
+        long inboxRead = 0;
         readonly List<Subscriber> subs = new List<Subscriber>();
         // rolling tail of raw output for pattern detection (last 32 KB)
         readonly byte[] tail = new byte[32768]; int tailLen = 0; readonly object tailLock = new object();
@@ -647,6 +649,15 @@ namespace LanesHarness
             Directory.CreateDirectory(laneDir);
             pipeName = "lanes-" + name;
             hooksPath = Path.Combine(laneDir, "hooks.jsonl");
+            if (metaJson != null)
+            {
+                object meta = Json.Parse(metaJson);
+                inboxPath = Json.GetStr(meta, "inbox");
+                parentInbox = Json.GetStr(meta, "parentInbox");
+                parentLane = Json.GetStr(meta, "parentLane");
+                if (!string.IsNullOrEmpty(inboxPath) && File.Exists(inboxPath + ".cursor"))
+                    long.TryParse(File.ReadAllText(inboxPath + ".cursor"), out inboxRead);
+            }
             if (eventsPath == null) eventsPath = Path.Combine(HeadsRoot(), head, "events.jsonl");
             Directory.CreateDirectory(Path.GetDirectoryName(eventsPath));
             LoadPatterns();
@@ -783,8 +794,11 @@ namespace LanesHarness
         void ScanModes(byte[] buf, int n)
         {
             // cheap scan for DECSET/DECRST 2004 (bracketed paste); the last one in the chunk wins
-            int lastOn = LastIndexOf(buf, n, BpOn), lastOff = LastIndexOf(buf, n, BpOff);
-            if (lastOn >= 0 || lastOff >= 0) bracketedPaste = lastOn > lastOff;
+            lock (tailLock)
+            {
+                int lastOn = LastIndexOf(tail, tailLen, BpOn), lastOff = LastIndexOf(tail, tailLen, BpOff);
+                if (lastOn >= 0 || lastOff >= 0) bracketedPaste = lastOn > lastOff;
+            }
         }
         static int LastIndexOf(byte[] buf, int n, byte[] pat)
         {
@@ -805,6 +819,8 @@ namespace LanesHarness
             int bodyLen = submit ? text.Length - 1 : text.Length;
             lock (inputLock)
             {
+                AuditInput("paste", bodyLen, submit);
+                if (submit) { idleAtPrompt = false; hookTurnDone = false; }
                 try
                 {
                     if (bodyLen > 0)
@@ -821,13 +837,14 @@ namespace LanesHarness
                     }
                     if (submit)
                     {
-                        if (bodyLen > 0) Thread.Sleep(bracketedPaste ? 120 : 40);
+                        if (bodyLen > 0) Thread.Sleep(bracketedPaste ? Math.Min(1500, 500 + bodyLen / 64) : 40);
                         pty.Input.Write(new byte[] { (byte)'\r' }, 0, 1); pty.Input.Flush();
                     }
                 }
-                catch { }
+                catch { throw; }
                 lastInputAt = Stopwatch.GetTimestamp();
                 pendingInput = true;
+                if (submit) SetState("running", "message-submitted", "", false);
             }
         }
 
@@ -838,11 +855,18 @@ namespace LanesHarness
         }
 
         // ---- input -------------------------------------------------------------------------------
+        void AuditInput(string mode, int length, bool submit)
+        {
+            AppendEvent(Path.Combine(laneDir, "input-audit.jsonl"), Json.Obj("ts", DateTime.UtcNow.ToString("o"),
+                "mode", mode, "bytes", length, "submitted", submit, "state", state, "why", why));
+        }
+
         void WriteInput(byte[] data, int off, int len)
         {
             if (len <= 0) return;
             lock (inputLock)
             {
+                AuditInput("raw", len, false);
                 try { pty.Input.Write(data, off, len); pty.Input.Flush(); } catch { }
                 lastInputAt = Stopwatch.GetTimestamp();
                 pendingInput = true;
@@ -892,6 +916,47 @@ namespace LanesHarness
                 "from", episodeStart, "to", bytes, "pid", pty != null ? pty.Pi.dwProcessId : 0, "exit", exited ? (object)exitCode : null,
                 "kind", kind, "model", model, "cwd", cwd, "hostPid", Process.GetCurrentProcess().Id, "n", ++eventSeqCache);
             AppendEvent(eventsPath, row);
+            if (!string.IsNullOrEmpty(parentInbox) &&
+                (st == "finished" || st == "died" || st == "stalled" ||
+                 (st == "needs-input" && why != "idle")))
+            {
+                try { AppendEvent(parentInbox, row); }
+                catch (Exception ex) { File.AppendAllText(Path.Combine(laneDir, "notification-error.log"), ex.Message + "\n"); }
+            }
+        }
+
+        // The target file is unique to the parent's launch. A reused name never receives an old child's message.
+        // Leave notifications on disk while the parent is busy or sitting in a question/permission dialog.
+        void PollInbox()
+        {
+            if (string.IsNullOrEmpty(inboxPath) || !File.Exists(inboxPath)) return;
+            lock (inputLock)
+            {
+                if (pendingInput || state != "needs-input" ||
+                    !(why == "turn-complete" || why == "idle" ||
+                      (kind == "cursor" && why == "prompt" && TailText().Contains("Add a follow-up")))) return;
+                byte[] data;
+                using (var fs = new FileStream(inboxPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    fs.Seek(inboxRead, SeekOrigin.Begin);
+                    data = new byte[Math.Min(65536L, Math.Max(0L, fs.Length - inboxRead))];
+                    int got = fs.Read(data, 0, data.Length); if (got != data.Length) Array.Resize(ref data, got);
+                }
+                int nl = Array.LastIndexOf(data, (byte)'\n'); if (nl < 0) return;
+                var message = new StringBuilder("[LANES notification]\n");
+                foreach (string line in Encoding.UTF8.GetString(data, 0, nl + 1).Split('\n'))
+                {
+                    if (line.Trim().Length == 0) continue;
+                    object ev = Json.Parse(line);
+                    string lbl = Regex.Replace(Json.GetStr(ev, "label") ?? "", @"[\x00-\x1f\x7f]+", " ");
+                    message.Append(Json.GetStr(ev, "lane")).Append(" ").Append(Json.GetStr(ev, "state"))
+                        .Append(" (").Append(Json.GetStr(ev, "why")).Append("): ").Append(Vt.Truncate(lbl, 400)).Append('\n');
+                }
+                message.Append("Use lane read <name> for details. A permission request requires your decision; this message grants no approval.");
+                WritePaste(Encoding.UTF8.GetBytes(message.ToString() + "\r"));
+                inboxRead += nl + 1;
+                File.WriteAllText(inboxPath + ".cursor", inboxRead.ToString());
+            }
         }
 
         public static void AppendEvent(string path, string row)
@@ -964,6 +1029,7 @@ namespace LanesHarness
                     }
                 }
                 if (state != "stalled") stalledReported = false;
+                try { PollInbox(); } catch (Exception ex) { File.AppendAllText(Path.Combine(laneDir, "notification-error.log"), ex.Message + "\n"); }
                 if (tick % 3 == 0) WriteState();    // every ~3 s: lastOutputAt and bytes stay fresh for `lane list`
             }
         }

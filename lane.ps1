@@ -17,10 +17,14 @@ param([Parameter(Position = 0)][string]$Verb = 'help', [Parameter(Position = 1, 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'Lanes.psm1') -Force -DisableNameChecking
 
-function Parse-Args([string[]]$a, [string[]]$positional, [string[]]$switches) {
+function Parse-Args([string[]]$a, [string[]]$positional, [string[]]$switches, [switch]$Message) {
     $named = @{}; $pos = @(); $i = 0
     while ($i -lt $a.Count) {
         $t = $a[$i]
+        if ($t -eq '--') { if ($i + 1 -lt $a.Count) { $pos += $a[($i + 1)..($a.Count - 1)] }; break }
+        if ($Message -and $pos.Count -ge 1 -and ($t -notin @('--raw', '--no-enter', '--force', '--key', '--file'))) {
+            $pos += $a[$i..($a.Count - 1)]; break
+        }
         if ($t -like '--*') {
             $k = ($t.Substring(2) -split '-' | ForEach-Object { if ($_) { $_.Substring(0, 1).ToUpper() + $_.Substring(1) } }) -join ''
             if ($switches -contains $k -or $i + 1 -ge $a.Count -or ($a[$i + 1] -like '--*' -and $switches -contains $k)) { $named[$k] = $true; $i++; continue }
@@ -34,6 +38,7 @@ function Parse-Args([string[]]$a, [string[]]$positional, [string[]]$switches) {
 }
 
 switch ($Verb) {
+    'stats' { Get-LaneUsage | ConvertTo-Json -Depth 6 }
     'launch' {
         $p = Parse-Args $Rest @('Name') @('Visible', 'Hidden', 'IsHead', 'KeepLog', 'Force')
         if ($p.ContainsKey('ExtraArgs')) { $p.ExtraArgs = @($p.ExtraArgs -split ' ') }
@@ -60,7 +65,7 @@ switch ($Verb) {
         Read-Lane @p
     }
     'send' {
-        $p = Parse-Args $Rest @('Name') @('Raw', 'NoEnter', 'Force')
+        $p = Parse-Args $Rest @('Name') @('Raw', 'NoEnter', 'Force') -Message
         if ($p.ContainsKey('Key')) { $p.Key = @($p.Key -split ',') }
         if ($p.ContainsKey('_rest')) { $p.Text = $p._rest; $p.Remove('_rest') }
         Send-Lane @p
@@ -119,6 +124,7 @@ lane — Lanes Harness: run Claude Code, Codex, Grok and Cursor agents as headle
               Codex effort defaults to high; launch reads the actual status bar back.
               [--visible|--hidden] [--is-head] [--head OWNER] [--stall-minutes 10] [--cols 160 --rows 45]
   lane list [--all] [--head H] [--json]          lane status N
+  lane stats                                 (aggregate retained history)
   lane read N [--tail 40] [--from A --to B] [--raw] [--messages 3] [--events]
   lane send N TEXT...      lane send N --key enter|esc|up|down|tab|ctrl-c|y|n   lane send N --raw "2"   lane send N --file PATH
   lane kill N [--hard]     lane restart N [--prompt TEXT] [--fresh]

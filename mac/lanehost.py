@@ -118,6 +118,12 @@ class Host:
         self.stall_min = int(a.get("stall-min", 10))
         self.quiet_sec = int(a.get("quiet-sec", 4))
         self.meta = json.loads(a["meta-json"]) if a.get("meta-json") else None
+        self.inbox_read = 0
+        self.inbox_path = (self.meta or {}).get("inbox", "")
+        if self.inbox_path and os.path.exists(self.inbox_path + ".cursor"):
+            with open(self.inbox_path + ".cursor") as f:
+                self.inbox_read = int(f.read() or 0)
+        self.parent_inbox = (self.meta or {}).get("parentInbox", "")
         self.restart_of = a.get("restart-of", "")
         self.restart_count = int(a.get("restart-count") or 0)
         self.events_path = a.get("events") or os.path.join(lc.heads_root(), self.head, "events.jsonl")
@@ -137,7 +143,7 @@ class Host:
         self.last_output = time.monotonic()
         self.last_state_change = time.monotonic()
         self.log_lock = threading.Lock()
-        self.input_lock = threading.Lock()
+        self.input_lock = threading.RLock()
         self.tail = bytearray()
         self.subs = []
         self.hooks_read = 0
@@ -315,14 +321,19 @@ class Host:
 
     # ---- input ---------------------------------------------------------------------------------------
 
+    def audit_input(self, mode, length, submit):
+        lc.append_line(os.path.join(self.lane_dir, "input-audit.jsonl"), json.dumps(dict(
+            ts=lc.now_iso(), mode=mode, bytes=length, submitted=submit, state=self.state, why=self.why)))
+
     def write_input(self, data):
         if not data:
             return
         with self.input_lock:
+            self.audit_input("raw", len(data), False)
             try:
                 os.write(self.master, data)
             except OSError:
-                pass
+                raise
             self.pending_input = True
 
     def write_paste(self, text):
@@ -330,16 +341,21 @@ class Host:
         submit = text.endswith(b"\r")
         body = text[:-1] if submit else text
         with self.input_lock:
+            self.audit_input("paste", len(body), submit)
+            if submit:
+                self.idle_at_prompt = self.hook_turn_done = False
             try:
                 if body:
                     os.write(self.master, (b"\x1b[200~" + body + b"\x1b[201~") if self.bracketed else body)
                 if submit:
                     if body:
-                        time.sleep(0.12 if self.bracketed else 0.04)
+                        time.sleep(min(1.5, 0.5 + len(body) / 64000) if self.bracketed else 0.04)
                     os.write(self.master, b"\r")
             except OSError:
-                pass
+                raise
             self.pending_input = True
+            if submit:
+                self.set_state("running", "message-submitted", "", False)
 
     # ---- state ---------------------------------------------------------------------------------------
 
@@ -373,7 +389,45 @@ class Host:
         row = dict(ts=lc.now_iso(), head=self.head, lane=self.name, state=st, why=self.why, label=self.label,
                    **{"from": self.episode_start}, to=self.bytes, pid=self.child, exit=self.exit_code if self.exited else None,
                    kind=self.kind, model=self.model, cwd=self.cwd, hostPid=os.getpid(), n=self.event_n)
-        lc.append_line(self.events_path, json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+        encoded = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        lc.append_line(self.events_path, encoded)
+        if self.parent_inbox and (st in ("finished", "died", "stalled") or (st == "needs-input" and self.why != "idle")):
+            try:
+                lc.append_line(self.parent_inbox, encoded)
+            except OSError as e:
+                self.notification_error(e)
+
+    def notification_error(self, error):
+        with open(os.path.join(self.lane_dir, "notification-error.log"), "a") as f:
+            f.write(str(error) + "\n")
+
+    def poll_inbox(self):
+        if not self.inbox_path or not os.path.exists(self.inbox_path):
+            return
+        with self.input_lock:
+            if self.pending_input or self.state != "needs-input" or not (
+                self.why in ("turn-complete", "idle") or
+                (self.kind == "cursor" and self.why == "prompt" and "Add a follow-up" in self.tail_text())
+            ):
+                return
+            with open(self.inbox_path, "rb") as f:
+                f.seek(self.inbox_read)
+                data = f.read(65536)
+            nl = data.rfind(b"\n")
+            if nl < 0:
+                return
+            message = ["[LANES notification]"]
+            for line in data[:nl + 1].splitlines():
+                if not line.strip():
+                    continue
+                ev = json.loads(line)
+                label = re.sub(r"[\x00-\x1f\x7f]+", " ", ev.get("label") or "")
+                message.append("%s %s (%s): %s" % (ev.get("lane"), ev.get("state"), ev.get("why"), lc.truncate(label, 400)))
+            message.append("Use lane read <name> for details. A permission request requires your decision; this message grants no approval.")
+            self.write_paste(("\n".join(message) + "\r").encode("utf-8"))
+            self.inbox_read += nl + 1
+            with open(self.inbox_path + ".cursor", "w") as f:
+                f.write(str(self.inbox_read))
 
     # ---- watcher: hooks, quiescence, stall -------------------------------------------------------------
 
@@ -395,6 +449,10 @@ class Host:
                 self._tick()
             except Exception:
                 pass
+            try:
+                self.poll_inbox()
+            except Exception as e:
+                self.notification_error(e)
             if self.state != "stalled":
                 self.stalled_reported = False
             if tick % 3 == 0:

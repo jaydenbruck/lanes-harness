@@ -10,6 +10,23 @@ on PATH, so lanes can run lanes too.
 
 ## The loop
 
+When you run inside a lane, children automatically send notifications back as submitted messages.
+You can continue independent work or finish your turn; the host submits queued notifications when you
+reach a message prompt. Busy turns and permission/question dialogs defer delivery. Your ordinary
+restart preserves the inbox and delivery cursor. A fresh launch creates a new inbox.
+
+The actual parent comes from `LANES_LANE`, independently of the owning head. `--parent-lane NAME`
+selects a hosted parent explicitly; `--parent-lane none` disables push. Outside a hosted lane, use the
+wait loop below. `other` parents need a turn-complete hook. Parent hosts installed before this feature
+need an upgrade. `lane events` remains the durable record, including when message delivery fails.
+
+`--permissions default` uses the provider's configured permission behavior. The existing default is
+`--permissions bypass`. A child's permission notification is a request for your decision. LANES never
+grants permission by itself. `lane stats` gives counts from the retained history without transcript text.
+
+For sends, place options before the message. Text after the first message word stays literal, including
+`--flags`. Use `lane send NAME -- --force is literal` for a message starting with an option name.
+
 ```
 lane launch --name api  --kind claude --model opus  --cwd C:\src\myapp --brief briefs\api.md
 lane launch --name sec  --kind codex  --effort high --cwd C:\src\myapp --prompt "Audit the auth module."

@@ -54,9 +54,9 @@ def current_consumer():
     """A registered head is its own consumer; a lane-hosted helper is its lane name; the human is 'user'."""
     if os.environ.get("LANES_CONSUMER"):
         return os.environ["LANES_CONSUMER"]
-    if os.environ.get("LANES_HEAD") and os.environ["LANES_HEAD"] != "user":
-        return os.environ["LANES_HEAD"]
-    return os.environ.get("LANES_LANE") or "user"
+    if os.environ.get("LANES_LANE"):
+        return os.environ["LANES_LANE"]
+    return os.environ.get("LANES_HEAD") or "user"
 
 
 def cursor_path(head, consumer):
@@ -87,6 +87,8 @@ def get_state(name):
                    "from": st.get("episodeStart"), "to": st.get("bytes"), "pid": st.get("pid"), "exit": None, "kind": st.get("kind"),
                    "model": st.get("model"), "cwd": st.get("cwd"), "hostPid": st.get("hostPid"), "n": 0}
             lc.append_line(os.path.join(lc.heads_root(), st.get("head") or "user", "events.jsonl"), json.dumps(row, ensure_ascii=False))
+            if (st.get("meta") or {}).get("parentInbox"):
+                lc.append_line(st["meta"]["parentInbox"], json.dumps(row, ensure_ascii=False))
         except FileExistsError:
             pass
         except OSError:
@@ -311,7 +313,8 @@ def ensure_shim():
 
 def start_lane(name, kind="claude", model="", cwd=None, brief="", prompt="", command="", extra_args=None, effort="high",
                head="", is_head=False, visible=False, cols=160, rows=45, stall_minutes=10, stall_seconds=0,
-               resume_session="", restart_of="", restart_count=0, keep_log=False, force=False):
+               resume_session="", restart_of="", restart_count=0, keep_log=False, force=False,
+               parent_lane=None, parent_inbox="", permissions="bypass", inbox=""):
     lc.check_name(name)
     if kind not in ("claude", "codex", "grok", "cursor", "other"):
         raise LaneError("--kind must be claude, codex, grok, cursor or other")
@@ -322,6 +325,24 @@ def start_lane(name, kind="claude", model="", cwd=None, brief="", prompt="", com
         raise LaneError("cwd '%s' does not exist" % cwd)
     extra_args = list(extra_args or [])
     head = head or current_head()
+    lc.check_name(head)
+    if permissions not in ("bypass", "default"):
+        raise LaneError("--permissions must be bypass or default")
+    parent_lane = os.environ.get("LANES_LANE", "") if parent_lane is None else parent_lane
+    if parent_lane and parent_lane != "none":
+        lc.check_name(parent_lane)
+        if parent_lane == name:
+            raise LaneError("a lane cannot be its own parent")
+        if not parent_inbox:
+            parent = get_state(parent_lane)
+            if not parent or not parent.get("alive"):
+                raise LaneError("parent lane '%s' is not alive" % parent_lane)
+            assert_driveable(parent_lane, parent)
+            parent_inbox = (parent.get("meta") or {}).get("inbox", "")
+            if not parent_inbox:
+                print("warning: parent uses an older host; notifications remain in lane events", file=sys.stderr)
+    else:
+        parent_lane, parent_inbox = "", ""
     if is_head:
         register_head(name, name, force)
         head = "user"
@@ -362,7 +383,7 @@ def start_lane(name, kind="claude", model="", cwd=None, brief="", prompt="", com
         argv = shlex.split(command) + extra_args + ([first] if first else [])
     elif kind == "claude":
         settings = claude_settings(d)
-        argv = [resolve_exe("claude"), "--dangerously-skip-permissions"]
+        argv = [resolve_exe("claude")] + (["--dangerously-skip-permissions"] if permissions == "bypass" else [])
         if model:
             argv += ["--model", model]
         if resume_session:
@@ -377,7 +398,7 @@ def start_lane(name, kind="claude", model="", cwd=None, brief="", prompt="", com
         if any("'" in x for x in notify_parts):
             raise LaneError("paths used in the Codex notify hook cannot contain an apostrophe")
         notify = "notify=[" + ",".join("'%s'" % x for x in notify_parts) + "]"
-        argv = [resolve_exe("codex")] + (["resume", resume_session] if resume_session else []) + ["--yolo"]
+        argv = [resolve_exe("codex")] + (["resume", resume_session] if resume_session else []) + (["--yolo"] if permissions == "bypass" else [])
         if model:
             argv += ["-m", model]
         argv += ["-c", notify, "-C", cwd] + extra_args + ["-c", "model_reasoning_effort=" + effort] + ([first] if first else [])
@@ -386,7 +407,7 @@ def start_lane(name, kind="claude", model="", cwd=None, brief="", prompt="", com
         if strict_privacy():
             assert_grok_privacy()
         install_grok_hooks()
-        argv = [resolve_exe("grok"), "--no-alt-screen", "--permission-mode", "bypassPermissions"]
+        argv = [resolve_exe("grok"), "--no-alt-screen"] + (["--permission-mode", "bypassPermissions"] if permissions == "bypass" else [])
         if model:
             argv += ["--model", model]
         if resume_session:
@@ -400,7 +421,7 @@ def start_lane(name, kind="claude", model="", cwd=None, brief="", prompt="", com
         if strict_privacy():
             assert_cursor_zdr(model)
         # --force is Cursor's "run everything"; --trust answers the workspace-trust prompt up front.
-        argv = [resolve_exe("cursor"), "--force", "--trust", "--workspace", cwd]
+        argv = [resolve_exe("cursor"), "--workspace", cwd] + (["--force", "--trust"] if permissions == "bypass" else [])
         if model:
             argv += ["--model", model]
         if resume_session:   # Cursor mints its own chat id; there is no --session-id to pre-seed
@@ -412,13 +433,15 @@ def start_lane(name, kind="claude", model="", cwd=None, brief="", prompt="", com
     cmdline = " ".join(shlex.quote(x) for x in argv)
 
     launch_id = uuid.uuid4().hex
-    meta = {"isHead": bool(is_head), "visible": bool(visible), "launchedBy": current_head(), "launcherPid": os.getpid()}
+    inbox = inbox or os.path.join(d, "inbox", launch_id + ".jsonl")
+    os.makedirs(os.path.dirname(inbox), exist_ok=True)
+    meta = {"parentLane": parent_lane, "parentInbox": parent_inbox, "inbox": inbox, "permissions": permissions, "isHead": bool(is_head), "visible": bool(visible), "launchedBy": current_head(), "launcherPid": os.getpid()}
     launch = {"name": name, "head": head, "kind": kind, "model": model, "effort": effort if kind == "codex" else "", "actualEffort": "",
               "effortStatus": "", "effortReadbackAt": "", "cwd": cwd, "brief": brief, "prompt": first, "cmd": cmdline, "argv": argv,
               "sessionId": session_id, "cols": cols, "rows": rows, "stallMinutes": stall_minutes, "isHead": bool(is_head),
               "visible": bool(visible), "restartOf": restart_of, "restartCount": restart_count, "launchedBy": current_head(),
               "launcherPid": os.getpid(), "strictPrivacy": strict_privacy(), "launchedAt": lc.now_iso(), "exe": HOST,
-              "command": command}
+              "command": command, "parentLane": parent_lane, "parentInbox": parent_inbox, "permissions": permissions, "extraArgs": extra_args, "inbox": inbox}
     lc.write_json(os.path.join(d, "launch.json"), launch)
     lc.append_line(os.path.join(lc.lanes_root(), "_registry.jsonl"), json.dumps(launch, ensure_ascii=False))   # every launch is recorded
 
@@ -668,7 +691,9 @@ def restart_lane(name, prompt="", force=False, fresh=False):
                       head=launch["head"], prompt=p, command=launch.get("command", "") if launch["kind"] == "other" else "",
                       cols=launch.get("cols", 160), rows=launch.get("rows", 45), stall_minutes=launch.get("stallMinutes", 10),
                       resume_session=resume, restart_of=launch.get("restartOf") or name, restart_count=int(launch.get("restartCount") or 0) + 1,
-                      keep_log=True, force=force, is_head=bool(launch.get("isHead")), visible=bool(launch.get("visible")))
+                      keep_log=True, force=force, parent_lane=launch.get("parentLane") or "none",
+                      parent_inbox=launch.get("parentInbox", ""), inbox=launch.get("inbox", "") if not fresh else "", permissions=launch.get("permissions", "bypass"),
+                      extra_args=launch.get("extraArgs", []), is_head=bool(launch.get("isHead")), visible=bool(launch.get("visible")))
 
 
 # ---- events ----------------------------------------------------------------------------------------------
@@ -789,10 +814,16 @@ def start_viewer(port=7342, open_browser=False):
 
 # ---- command line ----------------------------------------------------------------------------------------
 
-def parse(args, positional, switches):
+def parse(args, positional, switches, message=False):
     named, pos, i = {}, [], 0
     while i < len(args):
         t = args[i]
+        if t == "--":
+            pos.extend(args[i + 1:])
+            break
+        if message and pos and t not in ("--raw", "--no-enter", "--force", "--key", "--file"):
+            pos.extend(args[i:])
+            break
         if t.startswith("--"):
             k = t[2:].replace("-", "_")
             if k in switches or i + 1 >= len(args):
@@ -817,11 +848,40 @@ def need(p, key):
     return p[key]
 
 
+def usage_stats():
+    import collections
+    import glob
+    launches, events, invalid = [], [], 0
+    files = [os.path.join(lc.lanes_root(), "_registry.jsonl")] + glob.glob(os.path.join(lc.heads_root(), "*", "events.jsonl"))
+    for path in files:
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8-sig") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    invalid += 1
+                    continue
+                (launches if path == files[0] else events).append(row)
+    return dict(launches=len(launches), uniqueNames=len({r.get("name") for r in launches}),
+                restarts=sum(bool(r.get("restartOf")) for r in launches),
+                byKind=dict(collections.Counter(r.get("kind", "") for r in launches)),
+                byMonth=dict(collections.Counter(r.get("launchedAt", "")[:7] for r in launches)),
+                events=len(events), byStateReason=dict(collections.Counter(r.get("state", "") + "/" + r.get("why", "") for r in events)),
+                invalidRows=invalid, note="Retained local records only. Restarts and tests count as launches; events can repeat. No approval outcome is inferred.")
+
+
 def main(argv):
     verb, rest = (argv[0], argv[1:]) if argv else ("help", [])
-    if verb == "launch":
+    if verb == "stats":
+        print(json.dumps(usage_stats(), indent=2))
+    elif verb == "launch":
         p = parse(rest, ["name"], {"visible", "hidden", "is_head", "force"})
         st = start_lane(need(p, "name"), kind=p.get("kind", "claude"), model=p.get("model", ""), cwd=p.get("cwd"), brief=p.get("brief", ""),
+                        parent_lane=p.get("parent_lane"), permissions=p.get("permissions", "bypass"),
                         prompt=p.get("prompt", ""), command=p.get("command", ""), extra_args=shlex.split(p.get("extra_args", "")),
                         effort=p.get("effort", "high"), head=p.get("head", ""), is_head=bool(p.get("is_head")), visible=bool(p.get("visible")),
                         cols=int(p.get("cols", 160)), rows=int(p.get("rows", 45)), stall_minutes=int(p.get("stall_minutes", 10)),
@@ -843,7 +903,7 @@ def main(argv):
         print(read_lane(need(p, "name"), tail=int(p.get("tail", 40)), frm=int(p.get("from", -1)), to=int(p.get("to", -1)), raw=bool(p.get("raw")),
                         messages=int(p.get("messages", 0)), nbytes=int(p.get("bytes", 262144)), events=bool(p.get("events"))))
     elif verb == "send":
-        p = parse(rest, ["name"], {"raw", "no_enter", "force"})
+        p = parse(rest, ["name"], {"raw", "no_enter", "force"}, message=True)
         keys = p["key"].split(",") if isinstance(p.get("key"), str) else None
         text = p["_rest"]
         if isinstance(p.get("raw"), bool) and p.get("raw") and not text:
