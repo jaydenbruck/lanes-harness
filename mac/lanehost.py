@@ -558,12 +558,10 @@ class Host:
             self.session_seen = tid
         tool = _gs(o, "tool_name", "toolName") or ""
         if key == "stop":
-            self.input_draft = False
             m = _gs(o, "last_assistant_message", "lastAssistantMessage") or self.last_assistant_from_transcript()
             self.last_assistant = m or ""
             self.hook_turn_done = self.idle_at_prompt = True
         elif ty == "agent-turn-complete":
-            self.input_draft = False
             self.last_assistant = _gs(o, "last-assistant-message", "last_assistant_message") or ""
             self.hook_turn_done = self.idle_at_prompt = True
         elif key == "notification":

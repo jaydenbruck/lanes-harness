@@ -1104,7 +1104,6 @@ namespace LanesHarness
             string tid = Json.GetStr(o, "thread-id"); if (string.IsNullOrEmpty(tid)) tid = Json.GetStr(o, "thread_id"); if (!string.IsNullOrEmpty(tid)) sessionIdSeen = tid;
             if (evKey == "stop")
             {
-                inputDraft = false;
                 string m = Json.GetStr(o, "last_assistant_message");
                 if (string.IsNullOrEmpty(m)) m = Json.GetStr(o, "lastAssistantMessage");
                 if (string.IsNullOrEmpty(m)) m = LastAssistantFromTranscript();
@@ -1113,7 +1112,6 @@ namespace LanesHarness
             }
             else if (ty == "agent-turn-complete")
             {
-                inputDraft = false;
                 string m = Json.GetStr(o, "last-assistant-message"); if (m == null) m = Json.GetStr(o, "last_assistant_message");
                 lastAssistant = m ?? "";
                 hookTurnDone = true; idleAtPrompt = true;

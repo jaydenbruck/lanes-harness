@@ -110,6 +110,22 @@ class Notifications(unittest.TestCase):
             self.host.poll_inbox()
             send.assert_not_called()
 
+    def test_draft_typed_while_busy_survives_completion_hook(self):
+        for event in ({"hook_event_name": "Stop", "last_assistant_message": "done"},
+                      {"type": "agent-turn-complete", "last-assistant-message": "done"}):
+            self.host.state = "running"
+            with patch.object(self.host, "audit_input"), patch.object(lanehost.os, "write"):
+                self.host.write_input(b"unfinished draft typed while busy")
+            self.host.pending_input = False
+            self.host.on_hook(event)
+            self.host.last_output = time.monotonic() - 10
+            with patch.object(self.host, "emit"):
+                self.host._tick()
+            self.assertTrue(self.host.input_draft)
+            with patch.object(self.host, "write_paste") as send:
+                self.host.poll_inbox()
+                send.assert_not_called()
+
     def test_first_consumer_read_retains_completed_event(self):
         head = self.path / "heads" / "head"
         head.mkdir(parents=True)

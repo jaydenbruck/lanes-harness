@@ -49,6 +49,7 @@ try {
     Wait-Until { (Get-LaneState parent).why -eq 'turn-complete' }
     Send-Lane parent 'unfinished draft' -Raw
     $r = Restart-Lane child
+    Hook parent @{ hook_event_name = 'Stop'; last_assistant_message = 'Finished while draft exists' }
     $before = Received parent
     Start-Sleep -Seconds 5
     Assert ((Received parent) -eq $before) 'raw draft defers notification'
